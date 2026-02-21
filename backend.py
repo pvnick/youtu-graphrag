@@ -66,6 +66,7 @@ app.add_middleware(
 # Global variables
 active_connections: Dict[str, WebSocket] = {}
 config = None
+_retriever_cache = {}  # Cache retrievers by dataset name to avoid re-initialization
 
 class ConnectionManager:
     def __init__(self):
@@ -115,6 +116,17 @@ class QuestionResponse(BaseModel):
     retrieved_chunks: List[str]
     reasoning_steps: List[Dict]
     visualization_data: Dict
+
+class IncrementalUpdateRequest(BaseModel):
+    text: str
+    source: Optional[str] = "manual_update"
+
+class IncrementalUpdateResponse(BaseModel):
+    success: bool
+    message: str
+    nodes_added: int
+    edges_added: int
+    entities: List[str]
 
 def ensure_demo_schema_exists() -> str:
     """Ensure default demo schema exists and return its path."""
@@ -432,10 +444,28 @@ async def construct_graph(request: GraphConstructionRequest, client_id: str = "d
         
         await send_progress_update(client_id, "construction", 5, "Initializing graph builder...")
         
-        # Get dataset paths
-        corpus_path = f"data/uploaded/{dataset_name}/corpus.json" 
-        # Choose schema: dataset-specific or default demo
-        schema_path = get_schema_path_for_dataset(dataset_name)
+        # Get dataset paths - first check config, then uploaded directory, then demo fallback
+        corpus_path = None
+        schema_path = None
+        
+        # Try to get from config first
+        global config
+        if config is None:
+            config = get_config("config/base_config.yaml")
+        
+        if dataset_name in config.datasets:
+            dataset_config = config.get_dataset_config(dataset_name)
+            corpus_path = dataset_config.corpus_path
+            schema_path = dataset_config.schema_path
+            logger.info(f"Using configured dataset {dataset_name}: corpus={corpus_path}, schema={schema_path}")
+        
+        # Fallback to uploaded directory
+        if corpus_path is None or not os.path.exists(corpus_path):
+            corpus_path = f"data/uploaded/{dataset_name}/corpus.json"
+        
+        # Choose schema if not set from config
+        if schema_path is None or not os.path.exists(schema_path):
+            schema_path = get_schema_path_for_dataset(dataset_name)
         
         if not os.path.exists(corpus_path):
             # Try demo dataset
@@ -444,12 +474,9 @@ async def construct_graph(request: GraphConstructionRequest, client_id: str = "d
         if not os.path.exists(corpus_path):
             raise HTTPException(status_code=404, detail="Dataset not found")
         
-        await send_progress_update(client_id, "construction", 10, "Loading configuration and corpus...")
+        logger.info(f"Final paths for {dataset_name}: corpus={corpus_path}, schema={schema_path}")
         
-        # Initialize config
-        global config
-        if config is None:
-            config = get_config("config/base_config.yaml")
+        await send_progress_update(client_id, "construction", 10, "Loading configuration and corpus...")
         
         # Initialize KTBuilder
         builder = constructor.KTBuilder(
@@ -684,20 +711,29 @@ async def ask_question(request: QuestionRequest, client_id: str = "default"):
             config = get_config("config/base_config.yaml")
 
         graphq = decomposer.GraphQ(dataset_name, config=config)
-        kt_retriever = retriever.KTRetriever(
-            dataset_name,
-            graph_path,
-            recall_paths=config.retrieval.recall_paths,
-            schema_path=schema_path,
-            top_k=config.retrieval.top_k_filter,
-            mode="agent",  # force agent mode
-            config=config
-        )
+        
+        # Use cached retriever if available
+        global _retriever_cache
+        if dataset_name in _retriever_cache:
+            kt_retriever = _retriever_cache[dataset_name]
+            logger.info(f"Using cached retriever for {dataset_name}")
+        else:
+            kt_retriever = retriever.KTRetriever(
+                dataset_name,
+                graph_path,
+                recall_paths=config.retrieval.recall_paths,
+                schema_path=schema_path,
+                top_k=config.retrieval.top_k_filter,
+                mode="agent",  # force agent mode
+                config=config
+            )
 
-        await send_progress_update(client_id, "retrieval", 40, "Building indices...")
-        loop = asyncio.get_running_loop()
-        # Offload index building to thread executor to avoid blocking event loop
-        await loop.run_in_executor(None, kt_retriever.build_indices)
+            await send_progress_update(client_id, "retrieval", 40, "Building indices...")
+            loop = asyncio.get_running_loop()
+            # Offload index building to thread executor to avoid blocking event loop
+            await loop.run_in_executor(None, kt_retriever.build_indices)
+            _retriever_cache[dataset_name] = kt_retriever
+            logger.info(f"Cached retriever for {dataset_name}")
 
         # Notify QA start via WS so frontend can show immediate progress
         try:
@@ -1045,11 +1081,32 @@ def prepare_reasoning_flow_visualization(reasoning_steps: List[Dict]) -> Dict:
 async def get_datasets():
     """Get list of available datasets"""
     datasets = []
+    seen_names = set()
+    
+    # Check config-defined datasets first
+    global config
+    if config is None:
+        config = get_config("config/base_config.yaml")
+    
+    if config and hasattr(config, 'datasets'):
+        for name in config.datasets:
+            graph_path = f"output/graphs/{name}_new.json"
+            if os.path.exists(graph_path):
+                has_custom_schema = os.path.exists(f"schemas/{name}.json")
+                datasets.append({
+                    "name": name,
+                    "type": "configured",
+                    "status": "ready",
+                    "has_custom_schema": has_custom_schema
+                })
+                seen_names.add(name)
     
     # Check uploaded datasets
     upload_dir = "data/uploaded"
     if os.path.exists(upload_dir):
         for item in os.listdir(upload_dir):
+            if item in seen_names:
+                continue
             item_path = os.path.join(upload_dir, item)
             if os.path.isdir(item_path):
                 corpus_path = os.path.join(item_path, "corpus.json")
@@ -1063,6 +1120,7 @@ async def get_datasets():
                         "status": status,
                         "has_custom_schema": has_custom_schema
                     })
+                    seen_names.add(item)
     
     # Add demo dataset
     demo_corpus = "data/demo/demo_corpus.json"
@@ -1247,6 +1305,179 @@ async def reconstruct_dataset(dataset_name: str, client_id: str = "default"):
             logger.warning(f"Failed to send error message: {_e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/datasets/{dataset_name}/update", response_model=IncrementalUpdateResponse)
+async def incremental_update(dataset_name: str, request: IncrementalUpdateRequest):
+    """
+    Incrementally update a knowledge graph with new information.
+    Extracts entities and relations from the provided text and merges them into the existing graph.
+    """
+    try:
+        if not GRAPHRAG_AVAILABLE:
+            raise HTTPException(status_code=503, detail="GraphRAG components not available")
+        
+        # Check if dataset exists
+        graph_path = f"output/graphs/{dataset_name}_new.json"
+        if not os.path.exists(graph_path):
+            raise HTTPException(status_code=404, detail=f"Dataset '{dataset_name}' not found. Please construct the graph first.")
+        
+        # Load existing graph
+        from utils.graph_processor import load_graph_from_json, save_graph_to_json
+        import networkx as nx
+        
+        graph = load_graph_from_json(graph_path)
+        initial_nodes = graph.number_of_nodes()
+        initial_edges = graph.number_of_edges()
+        
+        # Get schema for this dataset
+        schema_path = get_schema_path_for_dataset(dataset_name)
+        with open(schema_path, 'r') as f:
+            schema = json.load(f)
+        
+        # Initialize LLM client
+        from utils.call_llm_api import LLMCompletionCall
+        llm_client = LLMCompletionCall()
+        
+        # Create extraction prompt
+        schema_str = json.dumps(schema, ensure_ascii=False)
+        extraction_prompt = f"""You are an expert information extractor. Analyze the provided text and extract entities, their attributes, and relations in a structured JSON format.
+
+Guidelines:
+1. Use the following schema for extraction:
+   ```{schema_str}```
+2. Extract all valuable entities, attributes, and relationships from the text.
+3. Output Format: Return only JSON with:
+   - attributes: Map each entity to its descriptive features
+   - triples: List relations between entities in [entity1, relation, entity2] format
+   - entity_types: Map each entity to its schema type
+
+Text to analyze:
+```{request.text}```
+
+Output (JSON only):"""
+
+        # Call LLM to extract information
+        import json_repair
+        response = llm_client.call_api(extraction_prompt)
+        extracted = json_repair.loads(response)
+        
+        # Track new entities
+        new_entities = []
+        nodes_added = 0
+        edges_added = 0
+        
+        # Get current max node counter
+        existing_ids = [n for n in graph.nodes() if n.startswith('entity_') or n.startswith('attribute_')]
+        max_counter = 0
+        for nid in existing_ids:
+            try:
+                num = int(nid.split('_')[1])
+                max_counter = max(max_counter, num)
+            except:
+                pass
+        node_counter = max_counter + 1
+        
+        # Create chunk ID for this update
+        import nanoid
+        chunk_id = nanoid.generate(size=8)
+        
+        # Helper to find or create entity
+        def find_or_create_entity(name: str, entity_type: str = None) -> str:
+            nonlocal node_counter, nodes_added
+            # Check if entity already exists
+            for n, d in graph.nodes(data=True):
+                if d.get("label") == "entity":
+                    props = d.get("properties", {})
+                    if props.get("name") == name:
+                        return n
+            
+            # Create new entity
+            entity_id = f"entity_{node_counter}"
+            node_counter += 1
+            props = {"name": name, "chunk id": chunk_id}
+            if entity_type:
+                props["schema_type"] = entity_type
+            graph.add_node(entity_id, label="entity", properties=props, level=2)
+            nodes_added += 1
+            new_entities.append(name)
+            return entity_id
+        
+        # Process entity types
+        entity_types = extracted.get("entity_types", {})
+        
+        # Process attributes
+        attributes = extracted.get("attributes", {})
+        for entity_name, attr_list in attributes.items():
+            entity_type = entity_types.get(entity_name)
+            entity_id = find_or_create_entity(entity_name, entity_type)
+            
+            if isinstance(attr_list, list):
+                for attr in attr_list:
+                    attr_id = f"attribute_{node_counter}"
+                    node_counter += 1
+                    graph.add_node(attr_id, label="attribute", properties={"name": str(attr), "chunk id": chunk_id})
+                    graph.add_edge(entity_id, attr_id, relation="has_attribute")
+                    nodes_added += 1
+                    edges_added += 1
+        
+        # Process triples
+        triples = extracted.get("triples", [])
+        for triple in triples:
+            if len(triple) >= 3:
+                subj, pred, obj = triple[0], triple[1], triple[2]
+                subj_type = entity_types.get(subj)
+                obj_type = entity_types.get(obj)
+                
+                subj_id = find_or_create_entity(subj, subj_type)
+                obj_id = find_or_create_entity(obj, obj_type)
+                
+                # Add edge if it doesn't exist
+                if not graph.has_edge(subj_id, obj_id) or \
+                   not any(d.get('relation') == pred for u, v, d in graph.edges(subj_id, data=True) if v == obj_id):
+                    graph.add_edge(subj_id, obj_id, relation=pred)
+                    edges_added += 1
+        
+        # Save updated graph
+        # Convert to edge list format for saving
+        edges_data = []
+        for u, v, data in graph.edges(data=True):
+            edges_data.append({
+                "start_node": {"label": graph.nodes[u].get("label", "entity"), "properties": graph.nodes[u].get("properties", {})},
+                "relation": data.get("relation", "related_to"),
+                "end_node": {"label": graph.nodes[v].get("label", "entity"), "properties": graph.nodes[v].get("properties", {})}
+            })
+        
+        with open(graph_path, 'w', encoding='utf-8') as f:
+            json.dump(edges_data, f, ensure_ascii=False, indent=2)
+        
+        # Invalidate FAISS cache (will be rebuilt on next query)
+        cache_dir = f"retriever/faiss_cache_new/{dataset_name}"
+        if os.path.exists(cache_dir):
+            # Remove index files to force rebuild
+            for cache_file in ['node.index', 'triple.index', 'node_map.json', 'triple_map.json', 
+                              'node_embeddings.pt', 'node_embedding_cache.pt']:
+                cache_path = os.path.join(cache_dir, cache_file)
+                if os.path.exists(cache_path):
+                    os.remove(cache_path)
+            logger.info(f"Cleared FAISS cache for {dataset_name}")
+        
+        final_nodes = graph.number_of_nodes()
+        final_edges = graph.number_of_edges()
+        
+        return IncrementalUpdateResponse(
+            success=True,
+            message=f"Graph updated successfully. Added {nodes_added} nodes and {edges_added} edges.",
+            nodes_added=nodes_added,
+            edges_added=edges_added,
+            entities=new_entities
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Incremental update failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Update failed: {str(e)}")
+
+
 @app.get("/api/graph/{dataset_name}")
 async def get_graph_data(dataset_name: str):
     """Get graph visualization data"""
@@ -1278,8 +1509,39 @@ async def startup_event():
     os.makedirs("output/graphs", exist_ok=True)
     os.makedirs("output/logs", exist_ok=True)
     os.makedirs("schemas", exist_ok=True)
-    
+
     logger.info("🚀 Youtu-GraphRAG Unified Interface initialized")
+
+    # Pre-warm the ntsb_full retriever in the background so first user query is fast
+    async def _prewarm():
+        try:
+            await asyncio.sleep(2)  # let uvicorn finish binding
+            dataset_name = "ntsb_full"
+            graph_path = f"output/graphs/{dataset_name}_new.json"
+            if not os.path.exists(graph_path):
+                return
+            global config, _retriever_cache
+            if config is None:
+                config = get_config("config/base_config.yaml")
+            if dataset_name in _retriever_cache:
+                return
+            logger.info(f"🔥 Pre-warming retriever for {dataset_name}...")
+            schema_path = get_schema_path_for_dataset(dataset_name)
+            kt_retriever = retriever.KTRetriever(
+                dataset_name, graph_path,
+                recall_paths=config.retrieval.recall_paths,
+                schema_path=schema_path,
+                top_k=config.retrieval.top_k_filter,
+                mode="agent", config=config
+            )
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, kt_retriever.build_indices)
+            _retriever_cache[dataset_name] = kt_retriever
+            logger.info(f"✅ Retriever pre-warmed for {dataset_name}")
+        except Exception as e:
+            logger.warning(f"Pre-warm failed (non-fatal): {e}")
+
+    asyncio.create_task(_prewarm())
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

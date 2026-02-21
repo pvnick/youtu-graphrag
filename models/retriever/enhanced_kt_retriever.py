@@ -3,7 +3,7 @@ import pickle
 import threading
 import time
 from functools import lru_cache
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Any
 
 import faiss
 import numpy as np
@@ -11,12 +11,12 @@ import spacy
 import torch
 import torch.nn.functional as F
 import concurrent.futures
-from sentence_transformers import SentenceTransformer
 
 from models.retriever.faiss_filter import DualFAISSRetriever
 from utils import graph_processor
 from utils import call_llm_api
 from utils.logger import logger
+from utils.openai_embedder import get_embedder
 
 try:
     from config import get_config
@@ -28,7 +28,7 @@ class KTRetriever:
         self,
         dataset: str,
         json_path: str = None,
-        qa_encoder: Optional[SentenceTransformer] = None,
+        qa_encoder: Optional[Any] = None,
         device: str = "cuda",
         cache_dir: str = "retriever/faiss_cache_new",
         top_k: int = 5,
@@ -54,10 +54,10 @@ class KTRetriever:
             recall_paths = recall_paths if recall_paths != 2 else config.retrieval.recall_paths
             schema_path = schema_path or config.get_dataset_config(dataset).schema_path
             mode = mode if mode != "agent" else config.triggers.mode
-            qa_encoder = qa_encoder or SentenceTransformer(config.embeddings.model_name)
+            qa_encoder = qa_encoder or get_embedder(config.embeddings.model_name)
         
         self.graph = graph_processor.load_graph_from_json(json_path)
-        self.qa_encoder = qa_encoder or SentenceTransformer('all-MiniLM-L6-v2')
+        self.qa_encoder = qa_encoder or get_embedder('all-MiniLM-L6-v2')
 
         self.llm_client = call_llm_api.LLMCompletionCall()
         
@@ -147,15 +147,66 @@ class KTRetriever:
         """Build all FAISS indices for efficient retrieval."""
         self.faiss_retriever.build_indices()
         self._precompute_node_embeddings()
+        self._build_fast_lookup_indices()
+
+    def _build_fast_lookup_indices(self):
+        """
+        Pre-build O(1) lookup structures to avoid repeated O(N) scans per query:
+          - _node_id_to_faiss_idx: reverse map from node_id → FAISS index position
+          - _schema_type_to_nodes: index from schema_type → list of node_ids
+          - _node_out_edges / _node_in_edges: adjacency caches for one-hop lookups
+        """
+        import time as _time
+        t0 = _time.time()
+
+        # 1. Reverse FAISS node map: node_id → faiss_idx (was O(N) scan per node)
+        self._node_id_to_faiss_idx = {
+            node_id: int(idx)
+            for idx, node_id in self.faiss_retriever.node_map.items()
+        }
+
+        # 2. Schema type → node_ids index (was O(N) full graph scan per hop)
+        self._schema_type_to_nodes = {}
+        self._entity_nodes_no_type = []  # entity nodes without schema_type (backward compat)
+        for node_id, node_data in self.graph.nodes(data=True):
+            props = node_data.get('properties', {})
+            schema_type = props.get('schema_type', '')
+            if schema_type:
+                self._schema_type_to_nodes.setdefault(schema_type, []).append(node_id)
+            elif node_data.get('label') == 'entity':
+                self._entity_nodes_no_type.append(node_id)
+
+        # 3. Adjacency caches for O(degree) one-hop lookups (was O(|E|) full edge scan)
+        self._node_out_triples = {}  # node_id → [(u, rel, v), ...]
+        self._node_in_triples = {}
+        for u, v, data in self.graph.edges(data=True):
+            rel = data.get('relation', '')
+            self._node_out_triples.setdefault(u, []).append((u, rel, v))
+            self._node_in_triples.setdefault(v, []).append((u, rel, v))
+
+        logger.info(f"Fast lookup indices built in {_time.time()-t0:.1f}s — "
+                    f"{len(self._node_id_to_faiss_idx)} node entries, "
+                    f"{len(self._schema_type_to_nodes)} schema types")
 
     def _get_query_embedding(self, query: str) -> torch.Tensor:
         """
         Get query embedding with simple caching (most expensive operation)
         """
-        query_embed = torch.tensor(
-                    self.qa_encoder.encode(query)
-                ).float().to(self.device)
-        return query_embed
+        return self._encode_to_tensor(query)
+    
+    def _encode_to_tensor(self, text: str) -> torch.Tensor:
+        """
+        Encode text to a 1D tensor, handling both numpy and tensor outputs from encoder.
+        """
+        embedding = self.qa_encoder.encode(text)
+        if isinstance(embedding, torch.Tensor):
+            tensor = embedding.float().to(self.device)
+        else:
+            tensor = torch.tensor(embedding).float().to(self.device)
+        # Ensure 1D tensor (squeeze batch dimension if present)
+        if tensor.dim() > 1:
+            tensor = tensor.squeeze(0)
+        return tensor
 
     def _precompute_node_texts(self):
         """
@@ -324,7 +375,7 @@ class KTRetriever:
                             try:
                                 node_text = self._get_node_text(node)
                                 if node_text and not node_text.startswith('[Error'):
-                                    embedding = torch.tensor(self.qa_encoder.encode(node_text)).float().to(self.device)
+                                    embedding = self._encode_to_tensor(node_text)
                                     self.node_embedding_cache[node] = embedding
                                     total_processed += 1
                             except Exception as e2:
@@ -709,79 +760,115 @@ class KTRetriever:
     def _similarity_search_on_filtered_nodes(self, question_embed: torch.Tensor, filtered_nodes: list) -> Dict:
         """
         Perform similarity search only on filtered nodes.
+        Uses pre-built reverse map for O(1) node→FAISS-idx lookup instead of O(N) scan.
         """
         if not filtered_nodes:
             return {"top_nodes": []}
-        
+
+        # Use pre-built reverse map if available (O(1) per node vs O(N) linear scan)
+        reverse_map = getattr(self, '_node_id_to_faiss_idx', None)
+
         filtered_node_embeddings = []
         filtered_node_map = {}
-        
-        for idx, node_id in enumerate(filtered_nodes):
-            if node_id in self.faiss_retriever.node_map.values():
-                # Find the original index of this node in the FAISS index
+
+        for node_id in filtered_nodes:
+            if reverse_map is not None:
+                original_idx = reverse_map.get(node_id)
+            else:
+                # Fallback: O(N) scan (original slow path)
                 original_idx = None
                 for orig_idx, orig_node_id in self.faiss_retriever.node_map.items():
                     if orig_node_id == node_id:
-                        original_idx = orig_idx
+                        original_idx = int(orig_idx)
                         break
-                
-                if original_idx is not None:
-                    node_embedding = self.faiss_retriever.node_index.reconstruct(int(original_idx))
+
+            if original_idx is not None:
+                try:
+                    node_embedding = self.faiss_retriever.node_index.reconstruct(original_idx)
+                    filtered_node_map[len(filtered_node_embeddings)] = node_id
                     filtered_node_embeddings.append(node_embedding)
-                    filtered_node_map[len(filtered_node_embeddings) - 1] = node_id
-        
+                except Exception:
+                    pass
+
         if filtered_node_embeddings:
             filtered_embeddings_array = np.array(filtered_node_embeddings).astype('float32')
             temp_index = faiss.IndexFlatIP(filtered_embeddings_array.shape[1])
             temp_index.add(filtered_embeddings_array)
-            
+
+            q = question_embed.cpu().detach().numpy().reshape(1, -1).astype('float32')
             search_k = min(self.top_k, len(filtered_node_embeddings))
-            _, indices = temp_index.search(question_embed.reshape(1, -1), search_k)
-            
-            top_filtered_nodes = [filtered_node_map[idx] for idx in indices[0] if idx in filtered_node_map]
+            _, indices = temp_index.search(q, search_k)
+
+            top_filtered_nodes = [filtered_node_map[i] for i in indices[0] if i in filtered_node_map]
         else:
             top_filtered_nodes = filtered_nodes[:self.top_k]
-        
+
         return {"top_nodes": top_filtered_nodes}
 
     def _get_one_hop_triples_from_nodes(self, node_list: list) -> list:
+        """
+        Get one-hop triples from a list of nodes.
+        Uses pre-built adjacency dicts for O(degree) lookup instead of O(|E|) full scan.
+        """
+        out_adj = getattr(self, '_node_out_triples', None)
+        in_adj = getattr(self, '_node_in_triples', None)
 
         one_hop_triples = []
-        node_set = set(node_list)
-        
-        for u, v, data in self.graph.edges(data=True):
-            if u in node_set or v in node_set:
-                relation = data.get('relation', '')
-                u_name = self._get_node_name(u)
-                v_name = self._get_node_name(v)
-                one_hop_triples.append((u_name, relation, v_name))
-        
+        seen = set()
+
+        for node_id in node_list:
+            if out_adj is not None:
+                for triple in out_adj.get(node_id, []):
+                    if triple not in seen:
+                        one_hop_triples.append(triple)
+                        seen.add(triple)
+            if in_adj is not None:
+                for triple in in_adj.get(node_id, []):
+                    if triple not in seen:
+                        one_hop_triples.append(triple)
+                        seen.add(triple)
+
+            if len(one_hop_triples) >= self.top_k * 10:
+                break
+
+            # Fallback: use graph directly if adjacency cache not built
+            if out_adj is None:
+                for u, v, data in self.graph.out_edges(node_id, data=True):
+                    one_hop_triples.append((u, data.get('relation', ''), v))
+                for u, v, data in self.graph.in_edges(node_id, data=True):
+                    one_hop_triples.append((u, data.get('relation', ''), v))
+
         return one_hop_triples[:self.top_k]
 
     def _filter_nodes_by_schema_type(self, target_types: list) -> list:
         """
         Filter nodes based on their schema_type property.
-        
-        Args:
-            target_types: List of target schema types
-            
-        Returns:
-            List of filtered node IDs
+        Uses pre-built index for O(1) lookup instead of O(N) full graph scan.
         """
+        # Use fast pre-built index if available
+        if hasattr(self, '_schema_type_to_nodes'):
+            if not target_types:
+                # Return all entity nodes (typed + untyped)
+                all_typed = [n for nodes in self._schema_type_to_nodes.values() for n in nodes]
+                return all_typed + self._entity_nodes_no_type
+            filtered = []
+            for t in target_types:
+                filtered.extend(self._schema_type_to_nodes.get(t, []))
+            # Include untyped entity nodes for backward compatibility
+            filtered.extend(self._entity_nodes_no_type)
+            return filtered
+
+        # Fallback: original O(N) scan
         if not target_types:
             return list(self.graph.nodes())
-        
         filtered_nodes = []
         for node_id, node_data in self.graph.nodes(data=True):
             node_properties = node_data.get('properties', {})
             node_schema_type = node_properties.get('schema_type', '')
-            
             if node_schema_type in target_types:
                 filtered_nodes.append(node_id)
-            # Also include nodes without schema_type for backward compatibility
             elif not node_schema_type and node_data.get('label') == 'entity':
                 filtered_nodes.append(node_id)
-
         return filtered_nodes
 
     def _get_node_name(self, node_id: str) -> str:
@@ -1442,8 +1529,8 @@ class KTRetriever:
         """Collect and merge all scored triples from both paths."""
         all_scored_triples = []
         
-        # Add path2 scored triples if available
-        path2_scored = results['path2_results'].get('scored_triples', [])
+        # Add path2 scored triples if available (not present when recall_paths=1)
+        path2_scored = results.get('path2_results', {}).get('scored_triples', [])
         if path2_scored:
             all_scored_triples.extend(path2_scored)
         
@@ -1876,7 +1963,7 @@ class KTRetriever:
             if node in self.node_embedding_cache:
                 node_embed = self.node_embedding_cache[node]
             else:
-                node_embed = torch.tensor(self.qa_encoder.encode(node_text)).float().to(self.device)
+                node_embed = self._encode_to_tensor(node_text)
                 self.node_embedding_cache[node] = node_embed
             
             similarity = F.cosine_similarity(query_embed, node_embed, dim=0).item()
@@ -2040,8 +2127,8 @@ class KTRetriever:
                     continue
                 
                 triple_text = f"{head_text} {r} {tail_text}"
-                triple_embed = torch.tensor(self.qa_encoder.encode(triple_text)).float().to(self.device)
-                similarity = F.cosine_similarity(question_embed, triple_embed, dim=0).item()
+                triple_embed = self._encode_to_tensor(triple_text)
+                similarity = F.cosine_similarity(question_embed.unsqueeze(0), triple_embed.unsqueeze(0), dim=1).item()
                 relation_bonus = 0.0
                 if r.lower() in ['is', 'was', 'has', 'had', 'contains', 'located', 'born', 'died']:
                     relation_bonus = 0.1
@@ -2376,7 +2463,7 @@ class KTRetriever:
                     for j, chunk_id in enumerate(batch_chunk_ids):
                         try:
                             chunk_text = self.chunk2id[chunk_id]
-                            embedding = torch.tensor(self.qa_encoder.encode(chunk_text)).float().to(self.device)
+                            embedding = self._encode_to_tensor(chunk_text)
                             self.chunk_embedding_cache[chunk_id] = embedding
                             embeddings_list.append(embedding.cpu().numpy())
                             valid_chunk_ids.append(chunk_id)
@@ -2660,7 +2747,7 @@ class KTRetriever:
             chunk_similarities = []
             for i, (chunk_id, content) in enumerate(zip(chunk_ids, chunk_contents)):
                 try:
-                    chunk_embed = torch.tensor(self.qa_encoder.encode(content)).float().to(self.device)
+                    chunk_embed = self._encode_to_tensor(content)
                     
                     similarity = F.cosine_similarity(question_embed, chunk_embed, dim=0).item()
                     similarity = max(0.0, similarity)  # Ensure non-negative

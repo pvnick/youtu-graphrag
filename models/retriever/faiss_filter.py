@@ -10,9 +10,9 @@ import networkx as nx
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sentence_transformers import SentenceTransformer
 
 from utils.logger import logger
+from utils.openai_embedder import get_embedder
 
 class DualFAISSRetriever:
     def __init__(self, dataset, graph: nx.MultiDiGraph, model_name: str = "all-MiniLM-L6-v2", cache_dir: str = "retriever/faiss_cache_new", device: str = None):
@@ -22,7 +22,7 @@ class DualFAISSRetriever:
         :param cache_dir: cache directory for FAISS indices
         """
         self.graph = graph
-        self.model = SentenceTransformer(model_name)
+        self.model = get_embedder(model_name)
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
         self.dataset = dataset
@@ -335,9 +335,10 @@ class DualFAISSRetriever:
         
         return unique_nodes
 
-    def _get_3hop_neighbors(self, center: str) -> Set[str]:
+    def _get_3hop_neighbors(self, center: str, max_neighbors: int = 200) -> Set[str]:
         """
-        Optimized 3-hop neighbor search using BFS with caching
+        Optimized 3-hop neighbor search using BFS with caching.
+        max_neighbors caps the BFS to avoid 525K+ triple explosions on large graphs.
         """
         # Check if center node exists in both embedding map and graph
         if center not in self.node_id_to_embedding:
@@ -365,6 +366,10 @@ class DualFAISSRetriever:
                 
                 if depth >= 3:
                     continue
+                
+                # Hard cap: stop expanding if we already have enough neighbors
+                if len(neighbors) >= max_neighbors:
+                    break
                 
                 # Check if current node exists in graph before getting neighbors
                 if current_node not in self.graph.nodes:

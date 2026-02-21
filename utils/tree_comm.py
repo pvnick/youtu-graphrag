@@ -9,12 +9,18 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 import json_repair
-from sentence_transformers import SentenceTransformer
 from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity
 
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except ImportError:
+    FAISS_AVAILABLE = False
+
 from utils import call_llm_api
 from utils.logger import logger
+from utils.openai_embedder import get_embedder
 
 
 warnings.filterwarnings('ignore')
@@ -45,7 +51,7 @@ class FastTreeComm:
             embedding_model = embedding_model or config.tree_comm.embedding_model
             struct_weight = struct_weight if struct_weight != 0.3 else config.tree_comm.struct_weight
         
-        self.model = SentenceTransformer(embedding_model)
+        self.model = get_embedder(embedding_model)
         self.semantic_cache = {}
         self.struct_weight = struct_weight
         self.node_list = list(graph.nodes())
@@ -128,31 +134,127 @@ class FastTreeComm:
                 self.semantic_cache[nid] = emb.cpu().numpy()
         return np.array([self.semantic_cache[nid] for nid in node_ids])
 
-    def _compute_jaccard_matrix_vectorized(self, level_nodes):
-
+    def _compute_jaccard_matrix_vectorized(self, level_nodes, sparse=False):
+        """Compute Jaccard similarity matrix. Returns sparse if sparse=True."""
         node_to_idx = {node: i for i, node in enumerate(self.node_list)}
         level_indices = [node_to_idx[node] for node in level_nodes if node in node_to_idx]
 
+        n = len(level_nodes)
         if not level_indices:
-            return np.zeros((len(level_nodes), len(level_nodes)))
+            if sparse:
+                return sp.csr_matrix((n, n))
+            return np.zeros((n, n))
 
         sub_adj = self.adjacency_sparse[level_indices][:, level_indices]
-        intersection = sub_adj.dot(sub_adj.T).toarray()
+        intersection = sub_adj.dot(sub_adj.T)  # Keep sparse
         row_sums = np.array(sub_adj.sum(axis=1)).flatten()
 
-        union = row_sums[:, None] + row_sums - intersection
-        jaccard_matrix = intersection / (union + 1e-9)
-        np.fill_diagonal(jaccard_matrix, 1.0)
+        if sparse:
+            # For sparse output, only compute Jaccard where intersection is non-zero
+            intersection_coo = intersection.tocoo()
+            data = []
+            rows = []
+            cols = []
+            for i, j, val in zip(intersection_coo.row, intersection_coo.col, intersection_coo.data):
+                union_val = row_sums[i] + row_sums[j] - val
+                jaccard = val / (union_val + 1e-9)
+                data.append(jaccard)
+                rows.append(i)
+                cols.append(j)
+            # Add diagonal
+            for i in range(n):
+                data.append(1.0)
+                rows.append(i)
+                cols.append(i)
+            jaccard_matrix = sp.csr_matrix((data, (rows, cols)), shape=(n, n))
+            return jaccard_matrix
+        else:
+            intersection = intersection.toarray()
+            union = row_sums[:, None] + row_sums - intersection
+            jaccard_matrix = intersection / (union + 1e-9)
+            np.fill_diagonal(jaccard_matrix, 1.0)
+            return jaccard_matrix
 
-        return jaccard_matrix
+    def _compute_sim_matrix_knn(self, level_nodes, k=50):
+        """
+        Compute similarity matrix using FAISS k-NN for scalability.
+        Returns a SPARSE matrix - only k neighbors per node have non-zero similarity.
+        Memory: O(N*k) instead of O(N²)
+        
+        Args:
+            level_nodes: List of node IDs
+            k: Number of nearest neighbors to consider
+            
+        Returns:
+            Sparse CSR similarity matrix (N×N but only ~N*k entries)
+        """
+        node_count = len(level_nodes)
+        if node_count <= 1:
+            return sp.eye(node_count, format='csr')
+        
+        # Adjust k if we have fewer nodes
+        k = min(k, node_count)
+        
+        embeddings = self.get_triple_embeddings_batch(level_nodes)
+        embeddings_normalized = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-9)
+        embeddings_float32 = embeddings_normalized.astype(np.float32)
+        
+        # Build FAISS index
+        dim = embeddings_float32.shape[1]
+        index = faiss.IndexFlatIP(dim)  # Inner product = cosine similarity for normalized vectors
+        index.add(embeddings_float32)
+        
+        # Search for k nearest neighbors for each node
+        similarities, indices = index.search(embeddings_float32, k)
+        
+        # Build SPARSE semantic similarity matrix using COO format (efficient construction)
+        rows = []
+        cols = []
+        data = []
+        for i in range(node_count):
+            for j_idx in range(k):
+                j = indices[i, j_idx]
+                sim = float(similarities[i, j_idx])
+                # Add both (i,j) and (j,i) for symmetry
+                rows.extend([i, j])
+                cols.extend([j, i])
+                data.extend([sim, sim])
+        
+        semantic_sim_matrix = sp.csr_matrix((data, (rows, cols)), shape=(node_count, node_count))
+        
+        # Structural similarity (Jaccard) - now also sparse
+        structural_sim_matrix = self._compute_jaccard_matrix_vectorized(level_nodes, sparse=True)
+        
+        # Combine with weights (sparse + sparse = sparse)
+        sim_matrix = (self.struct_weight * structural_sim_matrix + 
+                     (1 - self.struct_weight) * semantic_sim_matrix)
+        
+        mem_mb = (sim_matrix.data.nbytes + sim_matrix.indices.nbytes + sim_matrix.indptr.nbytes) / 1e6
+        logger.info(f"Computed sparse k-NN similarity matrix for {node_count} nodes with k={k}, {sim_matrix.nnz:,} non-zeros, {mem_mb:.1f}MB")
+        return sim_matrix
 
     def _compute_sim_matrix(self, level_nodes):
+        """
+        Compute similarity matrix. Uses FAISS k-NN for large node counts (>1000),
+        falls back to exact dense computation for small counts to preserve exact behavior.
+        """
         start_time = time.time()
         
         node_count = len(level_nodes)
         if node_count <= 1:
             return np.eye(node_count)
 
+        # Use k-NN approximation for large node counts (>1000 nodes)
+        # This trades exactness for O(N log N) instead of O(N²) scaling
+        use_knn = FAISS_AVAILABLE and node_count > 1000
+        
+        if use_knn:
+            # Use k=100 for good accuracy, covers most relevant neighbors
+            k = min(100, node_count // 2)
+            logger.info(f"Using FAISS k-NN (k={k}) for {node_count} nodes")
+            return self._compute_sim_matrix_knn(level_nodes, k=k)
+        
+        # Original dense computation for small node counts
         embeddings = self.get_triple_embeddings_batch(level_nodes)
         
         embeddings_normalized = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-9)
@@ -162,6 +264,9 @@ class FastTreeComm:
         
         sim_matrix = (self.struct_weight * structural_sim_matrix + 
                      (1 - self.struct_weight) * semantic_sim_matrix)
+        
+        elapsed = time.time() - start_time
+        logger.info(f"Computed dense similarity matrix for {node_count} nodes in {elapsed:.2f}s")
         return sim_matrix
 
     def _fast_clustering(self, level_nodes, n_clusters=None):
@@ -278,7 +383,7 @@ class FastTreeComm:
                     center2 = current_centers[cluster2_id]
                     idx1 = center_to_idx[center1]
                     idx2 = center_to_idx[center2]
-                    center_sim = center_sim_matrix[idx1][idx2]
+                    center_sim = center_sim_matrix[idx1, idx2]
                     
                     if center_sim >= merge_threshold:
                         cluster_similarities.append({

@@ -530,6 +530,15 @@ class KTBuilder:
         logger.info(f"🚀🚀🚀🚀 {'Processing Level 3 and 4':^20} 🚀🚀🚀🚀")
         logger.info(f"{'➖' * 20}")
         self.triple_deduplicate()
+        
+        # Save checkpoint before community detection (expensive operation that may crash)
+        checkpoint_path = f"output/graphs/{self.dataset_name}_checkpoint.json"
+        logger.info(f"💾 Saving checkpoint before community detection: {checkpoint_path}")
+        self._save_graph(checkpoint_path)
+        logger.info(f"✅ Checkpoint saved successfully")
+        
+        # Community detection now uses FAISS k-NN for O(N log N) scaling
+        logger.info("🔄 Running community detection with FAISS k-NN optimization...")
         self.process_level4()
 
        
@@ -571,6 +580,13 @@ class KTBuilder:
             output.append(relationship)
 
         return output
+    
+    def _save_graph(self, output_path: str):
+        """Save graph to JSON file (for checkpointing)"""
+        output = self.format_output()
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(output, f, ensure_ascii=False, indent=2)
     
     def save_graphml(self, output_path: str):
         graph_processor.save_graph(self.graph, output_path)
